@@ -2,7 +2,7 @@ import { Clutter, GLib, GObject, Gio, Meta, Mtk } from '../dependencies/gi.js';
 import { Main, WindowManager } from '../dependencies/shell.js';
 import { WINDOW_ANIMATION_TIME } from '../dependencies/unexported/windowManager.js';
 
-import { Orientation, MoveModes, Settings } from '../common.js';
+import { MoveModes, Orientation, Settings } from '../common.js';
 import { Rect, Util } from './utility.js';
 import { TilingWindowManager as Twm } from './tilingWindowManager.js';
 
@@ -17,6 +17,27 @@ import { TilingWindowManager as Twm } from './tilingWindowManager.js';
 export default class TilingMoveHandler {
     constructor() {
         const moveOps = [Meta.GrabOp.MOVING, Meta.GrabOp.KEYBOARD_MOVING];
+
+        this._lastSprite = null;
+        global.stage.connectObject(
+            'captured-event',
+            (actor, event) => {
+                /* heuristic: the Clutter.Sprite that initiates the drag is
+                 * the last one getting a stage leave event */
+                if (event.type() === Clutter.EventType.LEAVE &&
+                    event.get_flags() & Clutter.EventFlags.FLAG_GRAB_NOTIFY) {
+                    const sprite = actor.get_context().get_backend().get_sprite?.(global.stage, event);
+
+                    /* workaround spurious leave events from tablet tools */
+                    if (sprite?.role === Clutter.SpriteRole?.POINTER)
+                        this._seenPointerLeave = true;
+
+                    if (sprite?.role !== Clutter.SpriteRole?.TABLET || !this._seenPointerLeave)
+                        this._lastSprite = sprite;
+                }
+            },
+            this
+        );
 
         global.display.connectObject(
             'grab-op-begin',
@@ -88,6 +109,7 @@ export default class TilingMoveHandler {
         this._wmPrefs = null;
 
         global.display.disconnectObject(this);
+        global.stage.disconnectObject(this);
 
         this._tilePreview.destroy();
 
@@ -119,6 +141,13 @@ export default class TilingMoveHandler {
             this._preparePreviewModeChange(this._currPreviewMode, window);
     }
 
+    getDragCoords() {
+        const coords = this._dragSprite?.get_coords?.();
+        if (coords)
+            return [coords.x, coords.y];
+        return global.get_pointer().slice(0, 2);
+    }
+
     _onMoveStarted(window, grabOp) {
         if (window.is_skip_taskbar())
             return;
@@ -127,7 +156,10 @@ export default class TilingMoveHandler {
         // because it may have been tiled with this extension before being
         // maximized so we need to restore its size to pre-tiling.
         this._wasMaximizedOnStart = window.maximizedHorizontally || window.maximizedVertically;
-        const [x, y] = global.get_pointer();
+
+        this._seenPointerLeave = false;
+        this._dragSprite = this._lastSprite;
+        const [x, y] = this.getDragCoords();
 
         // Try to restore the window size
         if (window.tiledRect || this._wasMaximizedOnStart) {
@@ -146,7 +178,7 @@ export default class TilingMoveHandler {
                     return GLib.SOURCE_REMOVE;
                 }
 
-                const [currX, currY] = global.get_pointer();
+                const [currX, currY] = this.getDragCoords();
                 const currPoint = { x: currX, y: currY };
                 const oldPoint = { x, y };
                 const moveDist = Util.getDistance(currPoint, oldPoint);
@@ -224,7 +256,7 @@ export default class TilingMoveHandler {
                 let isCtrlReplacement = false;
                 const ctrlReplacedTileGroup = [];
                 const topTileGroup = Twm.getTopTileGroup({ skipTopWindow: true });
-                const pointerPos = { x: global.get_pointer()[0], y: global.get_pointer()[1] };
+                const pointerPos = { x: this.getDragCoords()[0], y: this.getDragCoords()[1] };
                 const twHovered = topTileGroup.some(w => w.tiledRect.containsPoint(pointerPos));
                 if (this._currPreviewMode === MoveModes.ADAPTIVE_TILING && !this._splitRects.size && twHovered) {
                     isCtrlReplacement = true;
@@ -248,6 +280,8 @@ export default class TilingMoveHandler {
                 // of a different tile group, with ctrl-(super)-drag. The window may
                 // be maximized by ctrl-super-drag.
                 isCtrlReplacement && window.isTiled && Twm.updateTileGroup(ctrlReplacedTileGroup);
+
+                this._dragSprite = null;
             }
         } finally {
             if (this._posChangedId) {
@@ -277,7 +311,7 @@ export default class TilingMoveHandler {
     // Without the lowPerfMode enabled this will be called whenever the window is
     // moved (by listening to the position-changed signal)
     _onMoving(grabOp, window, lowPerfMode = false) {
-        const [x, y] = global.get_pointer();
+        const [x, y] = this.getDragCoords();
         const currPointerPos = { x, y };
 
         if (lowPerfMode) {
@@ -319,7 +353,7 @@ export default class TilingMoveHandler {
         const altL = Clutter.ModifierType.MOD1_MASK;
         const altGr = Clutter.ModifierType.MOD5_MASK;
         const meta = Clutter.ModifierType.MOD4_MASK;
-        const rmb = Meta.is_wayland_compositor()
+        const rmb = Util.is_wayland_compositor()
             ? Clutter.ModifierType.BUTTON2_MASK
             : Clutter.ModifierType.BUTTON3_MASK;
         const pressed = [ // idxs come from settings
